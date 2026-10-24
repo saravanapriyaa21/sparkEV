@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "If you use this software or the research it contains, please cite it as below."
+title: "SparkEV: A Personalized, Predictive and Explainable EV Intelligence System"
+type: software
+license: Apache-2.0
+url: "https://spark-ev.vercel.app"
+authors:
+  - given-names: "Ramya G. R."
+    affiliation: "Amrita Vishwa Vidyapeetham, Coimbatore, India"
+  - given-names: "Umashankar S."
+    affiliation: "Amrita Vishwa Vidyapeetham, Coimbatore, India"
+  - given-names: "Shravanthi S."
+    affiliation: "Amrita Vishwa Vidyapeetham, Coimbatore, India"
+  - given-names: "Saravana Priyaa C. R."
+    affiliation: "Amrita Vishwa Vidyapeetham, Coimbatore, India"
+  - given-names: "Gayathri U."
+    affiliation: "Amrita Vishwa Vidyapeetham, Coimbatore, India"
+  - given-names: "Rithanya K. A."
+    affiliation: "Amrita Vishwa Vidyapeetham, Coimbatore, India"
+  - given-names: "Irene Divya J."
+    affiliation: "Amrita Vishwa Vidyapeetham, Coimbatore, India"
+keywords:
+  - electric vehicles
+  - battery health
+  - federated learning
+  - explainable AI
+  - edge AI
+  - ESP32
+preferred-citation:
+  type: article
+  title: "SparkEV: A Personalized, Predictive, and Explainable Framework for Intelligent Electric Vehicle Management"
+  authors:
+    - given-names: "Ramya G. R."
+    - given-names: "Umashankar S."
+    - given-names: "Shravanthi S."
+    - given-names: "Saravana Priyaa C. R."
+    - given-names: "Gayathri U."
+    - given-names: "Rithanya K. A."
+    - given-names: "Irene Divya J."
