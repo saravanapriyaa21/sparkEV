@@ -239,8 +239,8 @@ Amrita Vishwa Vidyapeetham, Coimbatore, India
 | Dr. Ramya G. R. | Faculty, Department of Computer Science and Engineering |
 | Dr. Umashankar S. | Faculty, Department of Electrical and Electronics Engineering |
 | Shravanthi S. | Module 3: battery health and degradation risk |
-| Saravana Priyaa C. R. | Hardware deployment (ESP32) and Module 4: energy consumption |
-| Gayathri U. | Federated learning (FedPer) |
+| Saravana Priyaa C. R. | Hardware deployment (ESP32) |
+| Gayathri U. | Federated learning (FedPer) and Module 4: energy consumption |
 | Rithanya K. A. | Module 1: driving behaviour and battery stress |
 | Irene Divya J. | Module 2: charging anomaly detection |
 
