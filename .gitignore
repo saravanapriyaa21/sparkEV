@@ -1,0 +1,30 @@
+# ---------- Secrets ----------
+.env
+.env.*
+esp32/firmware/**/secrets.h
+
+# ---------- Data (not shared) ----------
+data/raw/*
+!data/raw/.gitkeep
+
+# ---------- Python ----------
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+esp32/tools/_model2_temp_dump.json
+
+# ---------- Node / dashboard ----------
+node_modules/
+dist/
+dist-ssr/
+*.local
+*.log
+
+# ---------- OS / editor ----------
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp

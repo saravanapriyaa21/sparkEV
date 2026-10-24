@@ -1,0 +1,12 @@
+# Extra packages needed to run the research notebooks in notebooks/.
+# Install after the main requirements:
+#   pip install -r requirements.txt -r requirements-notebooks.txt
+
+jupyter
+matplotlib
+seaborn
+scipy
+shap          # explanations (Modules 1 and 3)
+statsmodels   # capacity-fade model fitting (Module 1)
+torch         # federated learning experiments (Module 1)
+tensorflow    # neural network comparison (Module 4)
