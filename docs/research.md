@@ -62,16 +62,23 @@ energy.
 - Feature importance shows which session characteristics are behind each alert.
 - A check with all energy features removed confirms that the model does not depend on a single
   type of signal.
+- XGBoost is compared with three baselines: Isolation Forest (an unsupervised anomaly detector),
+  and two deep learning models for sequences, LSTM and TCN (temporal convolutional network).
 
 **Results** (530 test sessions, faulty-class metrics):
 
 | Model | Accuracy | Precision | Recall | F1 | ROC-AUC |
 |---|---|---|---|---|---|
+| Isolation Forest | 95.28% | 0.939 | 0.574 | 0.713 | 0.929 |
+| LSTM | 90.00% | 1.000 | 0.019 | 0.036 | 0.898 |
+| TCN | 89.81% | 0.000 | 0.000 | 0.000 | 0.633 |
 | XGBoost | **99.62%** | **1.000** | **0.963** | **0.981** | **0.999** |
 | XGBoost without energy features | 99.62% | 1.000 | 0.963 | 0.981 | 0.9998 |
 
-The model finds 52 of 54 faulty sessions without a single false alarm. Predicting every session
-as normal would already give 89.81% accuracy, which is why the faulty-class metrics matter most.
+Only about 10% of sessions are faulty, so predicting every session as normal already gives
+89.81% accuracy. This is why the faulty-class metrics matter most. TCN detects no faults and LSTM
+only 1 of 54, despite accuracy around 90%. Isolation Forest misses 23 of 54. XGBoost finds 52 of
+54 faulty sessions without a single false alarm.
 
 **Notebooks:** `notebooks/module2_charging_anomaly/`
 

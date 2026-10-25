@@ -67,7 +67,8 @@ behaviour alone.
 ### Module 2: Charging-session anomaly detection
 
 Detects charging sessions that are likely to be faulty. An XGBoost classifier labels each of
-2,649 real charging sessions as Normal or Faulty from 57 session features.
+2,649 real charging sessions as Normal or Faulty from 57 session features, and is compared with
+Isolation Forest, LSTM and TCN baselines.
 
 - **Result:** 99.62% accuracy, F1 = 0.981, 52 of 54 faults found with no false alarms
 - **Notebooks:** [`notebooks/module2_charging_anomaly/`](notebooks/module2_charging_anomaly/)
