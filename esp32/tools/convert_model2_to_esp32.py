@@ -1,678 +1,271 @@
+"""Convert the Module 2 federated networks to C headers for the ESP32.
+
+Usage (from the project root):
+
+    python esp32/tools/convert_model2_to_esp32.py
+
+Reads
+    models/model2_charge_level_fedavg.{json,npz}   charge level (Model A2), FedAvg
+    models/model2_urgency_fedper.{json,npz}        urgency (Model B), FedPer
+    esp32/tools/vectors/model2_demo_users.json     from export_model2_demo_users.py
+Writes
+    esp32/firmware/SparkEV_Integrated/model2_esp32_generated.h
+        both networks (shared weights, scaler statistics) and the C inference code
+    esp32/firmware/SparkEV_Integrated/model2_driver_vectors.h
+        per demo driver: raw input features, charging site, battery capacity and the
+        user's own FedPer urgency head (the personal layer that stays on the device)
+"""
 import json
 import math
-import joblib
 from pathlib import Path
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MODELS = PROJECT_ROOT / "models"
+FIRMWARE = PROJECT_ROOT / "esp32" / "firmware" / "SparkEV_Integrated"
+DEMO_USERS = PROJECT_ROOT / "esp32" / "tools" / "vectors" / "model2_demo_users.json"
 
-MODEL_PATH = PROJECT_ROOT / "models" / "model2_charging_fault_xgb.pkl"
-
-OUTPUT_PATH = (
-    PROJECT_ROOT
-    / "esp32"
-    / "firmware"
-    / "SparkEV_Integrated"
-    / "model2_esp32_generated.h"
-)
-
-
-# ============================================================
-# FLOAT FORMATTER
-# ============================================================
 
 def cpp_float(value):
     value = float(value)
-
     if math.isnan(value):
         return "NAN"
-
-    if math.isinf(value):
-        return "INFINITY" if value > 0 else "-INFINITY"
-
-    s = format(value, ".10g")
-
+    s = format(value, ".9g")
     if "e" not in s.lower() and "." not in s:
         s += ".0"
-
     return s + "f"
 
 
-# ============================================================
-# LOAD MODEL
-# ============================================================
-
-print("=" * 70)
-print("SparkEV Model 2 -> ESP32 Converter")
-print("=" * 70)
-
-print()
-print("Loading:")
-print(MODEL_PATH)
-
-model = joblib.load(MODEL_PATH)
-
-print()
-print("Model information")
-print("-" * 70)
-
-print("Model type :", type(model).__name__)
-print("Features   :", model.n_features_in_)
-print("Trees      :", model.n_estimators)
-print("Classes    :", model.classes_)
-
-if hasattr(model, "base_score"):
-    print("Base score :", model.base_score)
+def c_array(name, values, ctype="float"):
+    values = np.asarray(values).ravel()
+    if ctype == "float":
+        body = ",".join(cpp_float(v) for v in values)
+    else:
+        body = ",".join(str(int(v)) for v in values)
+    return f"static const {ctype} {name}[{len(values)}] = {{{body}}};\n"
 
 
-# ============================================================
-# VERIFY MODEL TYPE
-# ============================================================
+def load(name):
+    meta = json.load(open(MODELS / f"{name}.json"))
+    arrays = np.load(MODELS / f"{name}.npz")
+    layers = [arrays[f"G{i}"] for i in range(sum(k.startswith("G") for k in arrays.files))]
+    heads = {}
+    for key in arrays.files:
+        if key.startswith("H__"):
+            _, user, i = key.split("__")
+            heads.setdefault(user, {})[int(i)] = arrays[key]
+    return meta, layers, {u: [h[i] for i in sorted(h)] for u, h in heads.items()}
 
-if model.n_features_in_ != 57:
-    raise ValueError(
-        f"Expected 57 features, found {model.n_features_in_}"
+
+charge_meta, charge_layers, _ = load("model2_charge_level_fedavg")
+urg_meta, urg_layers, urg_heads = load("model2_urgency_fedper")
+demo = json.load(open(DEMO_USERS))
+
+H1, H2 = charge_layers[0].shape[1], charge_layers[2].shape[1]
+assert len(charge_layers) == 6 and len(urg_layers) == 6, "expected input -> H1 -> H2 -> output"
+assert urg_layers[0].shape[1] == H1 and urg_layers[2].shape[1] == H2
+
+anchor = charge_meta["spec"]["anchor"]
+locations = charge_meta["scaler"]["locations"]
+assert locations == urg_meta["scaler"]["locations"]
+
+
+def scaler_block(prefix, meta):
+    s = meta["scaler"]
+    out = f"#define {prefix}_NUM_FEATURES {len(s['feats'])}\n"
+    out += f"#define {prefix}_NUM_MISSING {len(s['miss_idx'])}\n"
+    out += f"#define {prefix}_INPUT_DIM {len(s['feats']) + len(s['miss_idx']) + len(s['locations'])}\n"
+    out += f"#define {prefix}_CLIP {cpp_float(s['clip'])}\n"
+    out += "// feature order: " + ", ".join(s["feats"]) + "\n"
+    out += c_array(f"{prefix.lower()}_mean", s["mean"])
+    out += c_array(f"{prefix.lower()}_std", s["std"])
+    out += c_array(f"{prefix.lower()}_miss_idx", s["miss_idx"], "int16_t")
+    return out
+
+
+def layer_block(prefix, layers, n):
+    out = ""
+    for i in range(n):
+        out += c_array(f"{prefix}_w{i}", layers[2 * i])
+        out += c_array(f"{prefix}_b{i}", layers[2 * i + 1])
+    return out
+
+
+header = f"""#pragma once
+
+#include <stdint.h>
+#include <math.h>
+
+// ============================================================
+// SparkEV Model 2 - Predictive charging recommendation
+// Automatically generated by esp32/tools/convert_model2_to_esp32.py
+//
+// Two federated networks ({charge_layers[0].shape[0]}/{urg_layers[0].shape[0]} -> {H1} -> {H2} -> out, ReLU):
+//   charge level (Model A2, FedAvg): 85th-percentile battery need (%)
+//     until the next charge; the network predicts the difference from
+//     the user's own mean need, which is added back here
+//   urgency (Model B, FedPer): Time-critical / Moderate / Flexible;
+//     shared base here, the personal head is in model2_driver_vectors.h
+// ============================================================
+
+#define MODEL2_NUM_LOCATIONS {len(locations)}
+#define MODEL2_HIDDEN1 {H1}
+#define MODEL2_HIDDEN2 {H2}
+#define MODEL2_NUM_URGENCY 3
+// charging sites: {", ".join(locations)}
+
+// ---------------- charge level (FedAvg) ----------------
+{scaler_block("M2A", charge_meta)}{layer_block("m2a", charge_layers, 3)}
+#define M2A_ANCHOR_COL {anchor["col"]}
+#define M2A_ANCHOR_MEAN {cpp_float(anchor["mean"])}
+#define M2A_ANCHOR_STD {cpp_float(anchor["std"])}
+#define M2A_ANCHOR_MISS_COL {anchor["miss_col"] if anchor["miss_col"] is not None else -1}
+#define M2A_ANCHOR_FILL {cpp_float(anchor["fill"])}
+#define M2A_SCALE {cpp_float(charge_meta["spec"]["scale"])}
+
+// ---------------- urgency (FedPer shared base) ----------------
+{scaler_block("M2B", urg_meta)}{layer_block("m2b", urg_layers, 2)}
+
+// ============================================================
+// Inference
+// ============================================================
+
+// Raw features -> scaled input: standardise and clip, 0 + "was missing"
+// flag for missing values (NAN), one-hot charging site.
+static inline void model2_scale_input(
+    const float* raw, int n_feats, const float* mean, const float* stdv,
+    const int16_t* miss_idx, int n_miss, int location, float clip, float* out)
+{{
+    for (int i = 0; i < n_feats; i++) {{
+        float z = isnan(raw[i]) ? 0.0f : (raw[i] - mean[i]) / stdv[i];
+        if (z > clip) z = clip;
+        if (z < -clip) z = -clip;
+        out[i] = z;
+    }}
+    for (int k = 0; k < n_miss; k++) {{
+        out[n_feats + k] = isnan(raw[miss_idx[k]]) ? 1.0f : 0.0f;
+    }}
+    for (int s = 0; s < MODEL2_NUM_LOCATIONS; s++) {{
+        out[n_feats + n_miss + s] = (s == location) ? 1.0f : 0.0f;
+    }}
+}}
+
+// Active weights. They point at the flash weights above until an on-device
+// federated learning round installs updated weights in RAM (fl_runtime.h).
+static const float* m2a_active[6] = {{m2a_w0, m2a_b0, m2a_w1, m2a_b1, m2a_w2, m2a_b2}};
+static const float* m2b_active[4] = {{m2b_w0, m2b_b0, m2b_w1, m2b_b1}};
+
+// y = x W + b (W stored row-major as [n_in][n_out]), optional ReLU
+static inline void model2_dense(
+    const float* x, int n_in, const float* w, const float* b, int n_out,
+    bool relu, float* y)
+{{
+    for (int j = 0; j < n_out; j++) {{
+        float acc = b[j];
+        for (int i = 0; i < n_in; i++) {{
+            acc += x[i] * w[i * n_out + j];
+        }}
+        y[j] = (relu && acc < 0.0f) ? 0.0f : acc;
+    }}
+}}
+
+// Model A2: 85th-percentile battery need (%) until the next charge
+static inline float model2_charge_need(const float* raw, int location)
+{{
+    float x[M2A_INPUT_DIM];
+    float h1[MODEL2_HIDDEN1];
+    float h2[MODEL2_HIDDEN2];
+    float out;
+
+    model2_scale_input(raw, M2A_NUM_FEATURES, m2a_mean, m2a_std,
+                       m2a_miss_idx, M2A_NUM_MISSING, location, M2A_CLIP, x);
+    model2_dense(x, M2A_INPUT_DIM, m2a_active[0], m2a_active[1], MODEL2_HIDDEN1, true, h1);
+    model2_dense(h1, MODEL2_HIDDEN1, m2a_active[2], m2a_active[3], MODEL2_HIDDEN2, true, h2);
+    model2_dense(h2, MODEL2_HIDDEN2, m2a_active[4], m2a_active[5], 1, false, &out);
+
+    float mean_need = x[M2A_ANCHOR_COL] * M2A_ANCHOR_STD + M2A_ANCHOR_MEAN;
+    if (M2A_ANCHOR_MISS_COL >= 0 && x[M2A_ANCHOR_MISS_COL] > 0.5f) {{
+        mean_need = M2A_ANCHOR_FILL;
+    }}
+    float need = (out + mean_need / M2A_SCALE) * M2A_SCALE;
+    if (need < 0.0f) need = 0.0f;
+    if (need > 90.0f) need = 90.0f;
+    return need;
+}}
+
+// Model B: urgency class (0 Time-critical, 1 Moderate, 2 Flexible),
+// using the shared base and the user's own head; fills probs[3]
+static inline int model2_urgency(
+    const float* raw, int location, const float* head_w, const float* head_b,
+    float* probs)
+{{
+    float x[M2B_INPUT_DIM];
+    float h1[MODEL2_HIDDEN1];
+    float h2[MODEL2_HIDDEN2];
+    float logits[MODEL2_NUM_URGENCY];
+
+    model2_scale_input(raw, M2B_NUM_FEATURES, m2b_mean, m2b_std,
+                       m2b_miss_idx, M2B_NUM_MISSING, location, M2B_CLIP, x);
+    model2_dense(x, M2B_INPUT_DIM, m2b_active[0], m2b_active[1], MODEL2_HIDDEN1, true, h1);
+    model2_dense(h1, MODEL2_HIDDEN1, m2b_active[2], m2b_active[3], MODEL2_HIDDEN2, true, h2);
+    model2_dense(h2, MODEL2_HIDDEN2, head_w, head_b, MODEL2_NUM_URGENCY, false, logits);
+
+    float top = logits[0];
+    for (int k = 1; k < MODEL2_NUM_URGENCY; k++) if (logits[k] > top) top = logits[k];
+    float sum = 0.0f;
+    for (int k = 0; k < MODEL2_NUM_URGENCY; k++) {{
+        probs[k] = expf(logits[k] - top);
+        sum += probs[k];
+    }}
+    int best = 0;
+    for (int k = 0; k < MODEL2_NUM_URGENCY; k++) {{
+        probs[k] /= sum;
+        if (probs[k] > probs[best]) best = k;
+    }}
+    return best;
+}}
+"""
+(FIRMWARE / "model2_esp32_generated.h").write_text(header)
+
+vectors = """#ifndef MODEL2_DRIVER_VECTORS_H
+#define MODEL2_DRIVER_VECTORS_H
+
+// ============================================================
+// SparkEV Model 2 driver-specific inputs
+// Automatically generated by esp32/tools/convert_model2_to_esp32.py
+// from esp32/tools/vectors/model2_demo_users.json
+//
+// Each demo driver is one real charging user of the Norwegian
+// residential dataset. NAN = feature not available (no history).
+// The urgency head is the user's own FedPer personal layer: it was
+// trained on this user's data and never left the user's device.
+// ============================================================
+
+"""
+for driver, d in sorted(demo.items()):
+    r = d["reference"]
+    raw_a = [np.nan if d["charge_level_features"][f] is None else d["charge_level_features"][f]
+             for f in charge_meta["scaler"]["feats"]]
+    raw_b = [np.nan if d["urgency_features"][f] is None else d["urgency_features"][f]
+             for f in urg_meta["scaler"]["feats"]]
+    head = urg_heads[d["user_id"]]
+    vectors += (
+        f"// Driver {driver}: user {d['user_id']} at site {d['location']} ({d['rule']})\n"
+        f"//   expected charge need {r['charge_need_q85_pct']:.4f} %, target {r['target_soc_pct']:.1f} %, "
+        f"urgency {r['urgency']}\n"
+        f"#define MODEL2_DRIVER{driver}_LOCATION {locations.index(d['location'])}\n"
+        f"#define MODEL2_DRIVER{driver}_BATTERY_KWH {cpp_float(d['battery_capacity_kwh'])}\n"
+        + c_array(f"MODEL2_DRIVER{driver}_CHARGE_INPUT", raw_a)
+        + c_array(f"MODEL2_DRIVER{driver}_URGENCY_INPUT", raw_b)
+        + c_array(f"MODEL2_DRIVER{driver}_HEAD_W", head[0])
+        + c_array(f"MODEL2_DRIVER{driver}_HEAD_B", head[1])
+        + "\n"
     )
-
-if model.n_estimators != 300:
-    raise ValueError(
-        f"Expected 300 trees, found {model.n_estimators}"
-    )
-
-
-# ============================================================
-# FEATURE NAMES
-# ============================================================
-
-feature_names = list(model.get_booster().feature_names)
-
-print()
-print("Features:")
-for i, name in enumerate(feature_names):
-    print(f"{i:2d}: {name}")
-
-
-# ============================================================
-# GET XGBOOST JSON MODEL
-# ============================================================
-
-booster = model.get_booster()
-
-json_config = json.loads(
-    booster.save_config()
-)
-
-raw_model = json.loads(
-    booster.get_dump(
-        dump_format="json",
-        with_stats=False
-    )[0]
-)
-
-
-# ============================================================
-# SAVE COMPLETE JSON MODEL TEMPORARILY
-# ============================================================
-
-temp_json = (
-    PROJECT_ROOT
-    / "esp32"
-    / "tools"
-    / "_model2_temp_dump.json"
-)
-
-booster.save_model(str(temp_json))
-
-with open(temp_json, "r") as f:
-    model_json = json.load(f)
-
-
-# ============================================================
-# MODEL PARAMETERS
-# ============================================================
-
-learner = model_json["learner"]
-
-objective_name = (
-    learner["objective"]["name"]
-)
-
-base_score_text = (
-    learner["learner_model_param"]["base_score"]
-)
-
-base_score = float(
-    base_score_text.strip("[]")
-)
-
-
-# ============================================================
-# TREE EXTRACTION
-# ============================================================
-
-gradient_booster = learner["gradient_booster"]
-
-model_trees = gradient_booster[
-    "model"
-]["trees"]
-
-
-if len(model_trees) != 300:
-    raise ValueError(
-        f"Expected 300 trees in JSON, "
-        f"found {len(model_trees)}"
-    )
-
-
-# ============================================================
-# OUTPUT DIRECTORY
-# ============================================================
-
-OUTPUT_PATH.parent.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-header = []
-
-header.append("#pragma once")
-header.append("")
-header.append("#include <stdint.h>")
-header.append("#include <math.h>")
-header.append("")
-header.append("// ============================================================")
-header.append("// SparkEV Model 2")
-header.append("// Automatically generated from trained XGBoost classifier")
-header.append("// ============================================================")
-header.append("")
-
-header.append(
-    f"#define MODEL2_NUM_FEATURES {len(feature_names)}"
-)
-
-header.append(
-    f"#define MODEL2_NUM_TREES {len(model_trees)}"
-)
-
-header.append(
-    f"#define MODEL2_BASE_SCORE {cpp_float(base_score)}"
-)
-
-header.append("")
-
-header.append(
-    "typedef struct {"
-)
-
-header.append(
-    "    const int16_t* left;"
-)
-
-header.append(
-    "    const int16_t* right;"
-)
-
-header.append(
-    "    const int8_t* feature;"
-)
-
-header.append(
-    "    const float* threshold;"
-)
-
-header.append(
-    "    const float* leaf;"
-)
-
-header.append(
-    "    uint16_t nodes;"
-)
-
-header.append(
-    "} Model2Tree;"
-)
-
-header.append("")
-
-
-# ============================================================
-# TREE ARRAYS
-# ============================================================
-
-print()
-print("Generating header...")
-print()
-
-for tree_index, tree in enumerate(model_trees):
-
-    left = tree["left_children"]
-    right = tree["right_children"]
-    split_indices = tree["split_indices"]
-    split_conditions = tree["split_conditions"]
-    base_weights = tree["base_weights"]
-
-    node_count = len(left)
-
-    features = []
-
-    for i in range(node_count):
-
-        if left[i] == -1 and right[i] == -1:
-            features.append(-1)
-        else:
-            features.append(
-                int(split_indices[i])
-            )
-
-    header.append(
-        f"static const int16_t model2_tree_{tree_index}_left[] = {{"
-        + ",".join(str(int(x)) for x in left)
-        + "};"
-    )
-
-    header.append(
-        f"static const int16_t model2_tree_{tree_index}_right[] = {{"
-        + ",".join(str(int(x)) for x in right)
-        + "};"
-    )
-
-    header.append(
-        f"static const int8_t model2_tree_{tree_index}_feature[] = {{"
-        + ",".join(str(int(x)) for x in features)
-        + "};"
-    )
-
-    header.append(
-        f"static const float model2_tree_{tree_index}_threshold[] = {{"
-        + ",".join(
-            cpp_float(x)
-            for x in split_conditions
-        )
-        + "};"
-    )
-
-    header.append(
-        f"static const float model2_tree_{tree_index}_leaf[] = {{"
-        + ",".join(
-            cpp_float(x)
-            for x in base_weights
-        )
-        + "};"
-    )
-
-    header.append("")
-
-    if (
-        tree_index == 0
-        or (tree_index + 1) % 25 == 0
-        or tree_index == len(model_trees) - 1
-    ):
-        print(
-            f"Generated tree "
-            f"{tree_index + 1}/{len(model_trees)}"
-        )
-
-
-# ============================================================
-# TREE TABLE
-# ============================================================
-
-header.append(
-    "static const Model2Tree model2_trees[MODEL2_NUM_TREES] = {"
-)
-
-for tree_index, tree in enumerate(model_trees):
-
-    node_count = len(
-        tree["left_children"]
-    )
-
-    header.append(
-        "    {"
-        f"model2_tree_{tree_index}_left,"
-        f"model2_tree_{tree_index}_right,"
-        f"model2_tree_{tree_index}_feature,"
-        f"model2_tree_{tree_index}_threshold,"
-        f"model2_tree_{tree_index}_leaf,"
-        f"{node_count}"
-        "},"
-    )
-
-header.append("};")
-header.append("")
-
-
-# ============================================================
-# SINGLE TREE EVALUATION
-# ============================================================
-
-header.append(
-    "static inline float model2_eval_tree("
-)
-header.append(
-    "    const Model2Tree& tree,"
-)
-header.append(
-    "    const float* features"
-)
-header.append(
-    ") {"
-)
-
-header.append(
-    "    int node = 0;"
-)
-
-header.append("")
-
-header.append(
-    "    while (true) {"
-)
-
-header.append(
-    "        if (tree.left[node] == -1 &&"
-)
-
-header.append(
-    "            tree.right[node] == -1) {"
-)
-
-header.append(
-    "            return tree.leaf[node];"
-)
-
-header.append(
-    "        }"
-)
-
-header.append("")
-
-header.append(
-    "        int feature = tree.feature[node];"
-)
-
-header.append(
-    "        float value = features[feature];"
-)
-
-header.append("")
-
-header.append(
-    "        if (value < tree.threshold[node]) {"
-)
-
-header.append(
-    "            node = tree.left[node];"
-)
-
-header.append(
-    "        } else {"
-)
-
-header.append(
-    "            node = tree.right[node];"
-)
-
-header.append(
-    "        }"
-)
-
-header.append(
-    "    }"
-)
-
-header.append(
-    "}"
-)
-
-header.append("")
-
-
-# ============================================================
-# MODEL 2 PREDICTION
-# ============================================================
-
-header.append(
-    "// Returns raw XGBoost probability/logit output"
-)
-
-header.append(
-    "static inline float model2_predict_raw("
-)
-
-header.append(
-    "    const float* features"
-)
-
-header.append(
-    ") {"
-)
-
-header.append(
-    "    float sum = MODEL2_BASE_SCORE;"
-)
-
-header.append("")
-
-header.append(
-    "    for (int i = 0;"
-)
-
-header.append(
-    "         i < MODEL2_NUM_TREES;"
-)
-
-header.append(
-    "         i++) {"
-)
-
-header.append(
-    "        sum += model2_eval_tree("
-)
-
-header.append(
-    "            model2_trees[i],"
-)
-
-header.append(
-    "            features"
-)
-
-header.append(
-    "        );"
-)
-
-header.append(
-    "    }"
-)
-
-header.append("")
-
-header.append(
-    "    return sum;"
-)
-
-header.append(
-    "}"
-)
-
-header.append("")
-
-
-# ============================================================
-# SIGMOID
-# ============================================================
-
-header.append(
-    "static inline float model2_sigmoid(float x) {"
-)
-
-header.append(
-    "    if (x >= 0.0f) {"
-)
-
-header.append(
-    "        float z = expf(-x);"
-)
-
-header.append(
-    "        return 1.0f / (1.0f + z);"
-)
-
-header.append(
-    "    } else {"
-)
-
-header.append(
-    "        float z = expf(x);"
-)
-
-header.append(
-    "        return z / (1.0f + z);"
-)
-
-header.append(
-    "    }"
-)
-
-header.append(
-    "}"
-)
-
-header.append("")
-
-
-# ============================================================
-# FINAL PREDICTION
-# ============================================================
-
-header.append(
-    "// Returns probability of class 1"
-)
-
-header.append(
-    "static inline float model2_predict("
-)
-
-header.append(
-    "    const float* features"
-)
-
-header.append(
-    ") {"
-)
-
-header.append(
-    "    float raw = model2_predict_raw(features);"
-)
-
-header.append(
-    "    return model2_sigmoid(raw);"
-)
-
-header.append(
-    "}"
-)
-
-header.append("")
-
-
-# ============================================================
-# CLASSIFICATION
-# ============================================================
-
-header.append(
-    "static inline int model2_class("
-)
-
-header.append(
-    "    const float* features"
-)
-
-header.append(
-    ") {"
-)
-
-header.append(
-    "    float probability = model2_predict(features);"
-)
-
-header.append(
-    "    return probability >= 0.5f ? 1 : 0;"
-)
-
-header.append(
-    "}"
-)
-
-header.append("")
-
-
-# ============================================================
-# WRITE HEADER
-# ============================================================
-
-with open(
-    OUTPUT_PATH,
-    "w"
-) as f:
-
-    f.write(
-        "\n".join(header)
-    )
-
-
-# ============================================================
-# CLEAN TEMP FILE
-# ============================================================
-
-try:
-    temp_json.unlink()
-except Exception:
-    pass
-
-
-# ============================================================
-# FINAL MESSAGE
-# ============================================================
-
-print()
-print("=" * 70)
-print("CONVERSION COMPLETE")
-print("=" * 70)
-
-print()
-print("Output:")
-print(OUTPUT_PATH)
-
-print()
-print("Model features :", len(feature_names))
-print("Model trees    :", len(model_trees))
-print("Base score     :", base_score)
-
-print()
-print("Float formatting:")
-print("  1.0  -> 1.0f")
-print("  3.0  -> 3.0f")
-print(" 17.0  -> 17.0f")
-print("  0.5  -> 0.5f")
-
-print()
-print("The generated header contains")
-print("the complete trained XGBoost")
-print("Model 2 tree ensemble.")
-
-print()
-print("Arduino header location:")
-print(OUTPUT_PATH)
-
-print("=" * 70)
+vectors += "#endif\n"
+(FIRMWARE / "model2_driver_vectors.h").write_text(vectors)
+
+print("written: model2_esp32_generated.h, model2_driver_vectors.h")
+for driver, d in sorted(demo.items()):
+    print(f"driver {driver}: user {d['user_id']}, expected need {d['reference']['charge_need_q85_pct']:.4f} %, "
+          f"urgency {d['reference']['urgency']}")
