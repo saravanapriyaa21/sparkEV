@@ -27,14 +27,15 @@ has a different name, use that name in the `cd` command.
 The datasets are not included in this repository because of their size and licences. Download
 them from the sources listed in the [README](../README.md#datasets).
 
-The server needs the following files in `data/raw/`:
+The server needs one file in `data/raw/`:
 
-| Files | Used by |
+| File | Used by |
 |---|---|
-| `LFP01_fast_feature.xlsx`, `NMC02_fast_feature.xlsx`, `Lab_fast_feature.xlsx`, `NMC01_Car01_fast_feature.xlsx`, `NMC01_slow_feature.xlsx`, `NMC01_Car02_fast_feature.xlsx` | Module 3 |
-| `processed_data_longer_than_30.xlsx` | Module 2 |
+| `Dataset1_charging_reports.csv` | Module 2 (site congestion history) |
 
-The server checks for these files when it starts and stops with an error if one is missing.
+All trained models, including the federated models and the demo inputs of the two drivers, are
+already in `models/`. The other datasets are needed only to run the notebooks or to export the
+federated models again (see the [ESP32 deployment guide](esp32_deployment.md)).
 
 ## 4. Set up Python
 
@@ -119,12 +120,12 @@ Windows. The ESP32 and the computer must be on the same network.
 2. Open `esp32/firmware/SparkEV_Integrated/SparkEV_Integrated.ino`.
 3. Select your board (for example **ESP32 Dev Module**) and port.
 4. Set **Tools > Partition Scheme** to **Huge APP (3MB No OTA/1MB SPIFFS)**. The program is about
-   2 MB because it contains all three models, and the default setting only allows 1.2 MB.
+   2 MB because it contains the models of the four prediction modules, and the default setting only allows 1.2 MB.
 5. Upload.
 6. Open the Serial Monitor at 115200 baud to follow the progress.
 
-The ESP32 connects to Wi-Fi, runs the three models, shows each result on the display and sends
-the results to the server. The dashboard updates automatically.
+The ESP32 connects to Wi-Fi, runs the models of the four prediction modules, shows each result on the
+display and sends the results to the server. The dashboard updates automatically.
 
 To switch the demonstration driver, change `#define TEST_DRIVER 17` at the top of the sketch to
 `17` or `24` and upload again.
@@ -159,8 +160,9 @@ a notebook in Google Colab instead, upload it and place the data in your Google 
 
 | Problem | Solution |
 |---|---|
-| Server stops with `Model 3 dataset not found` | A dataset file is missing from `data/raw/`. See step 3. |
-| Dashboard shows "Waiting for ESP32 data" | No result has reached the server yet. Check that the ESP32 is running, or use the test request in step 8. |
+| Server stops with `FileNotFoundError` for `Dataset1_charging_reports.csv` | The file is missing from `data/raw/`. See step 3. |
+| Dashboard shows "Connecting to your car" | No result has reached the server yet. Check that the ESP32 is running, or use the test request in step 8. |
+| Dashboard shows "Can't reach SparkEV" | The server is not running or not on port 8000. See step 5. |
 | ESP32 cannot reach the server | Check that `SERVER_URL` uses your computer's local IP address, not `localhost`, that both devices are on the same network, and that the server was started with `--host 0.0.0.0`. |
 | Upload fails with `text section exceeds available space in board` | The partition scheme is too small. Set **Tools > Partition Scheme** to **Huge APP (3MB No OTA/1MB SPIFFS)**. |
 | Display stays blank | Check the wiring and that the display uses I2C address `0x3C`. |
