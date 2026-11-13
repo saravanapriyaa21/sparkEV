@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -7,12 +7,24 @@ import os
 import pandas as pd
 import xgboost as xgb
 
-from model2_charging_fault import run_model2
+import json
 
-from model3_battery_degradation import (
-    run_model3,
-    prepare_model3_data
+from model2_charging_recommendation import (
+    URGENCY_NAMES,
+    predict_charge_need,
+    predict_urgency,
+    recommend_charging
 )
+
+from model2_charging_recommendation import STATIONS
+
+from whatif import run_whatif
+
+from model3_soh_federated import (
+    run_model3,
+    DRIVER_BATTERIES as MODEL3_DRIVER_BATTERIES
+)
+import federated
 
 
 # ==================================================
@@ -61,117 +73,53 @@ print("Model 1 loaded successfully")
 
 
 # ==================================================
-# MODEL 2
+# MODEL 2 - CHARGING RECOMMENDATION
 #
+# The ESP32 runs the charge-level and urgency
+# networks. The server always runs the site
+# congestion model and the station ranking
+# (model2_charging_recommendation.py).
+# ==================================================
+
+print("Model 2 loaded through model2_charging_recommendation.py")
+
+
+# ==================================================
+# MODEL 2 DEMO USERS
+#
+# One real charging user per demo driver, chosen by
+# esp32/tools/export_model2_demo_users.py.
 # Used only by OLD /predict testing endpoint.
-# Final ESP32 architecture uses ESP32 Model 2.
 # ==================================================
 
-print("Model 2 loaded through model2_charging_fault.py")
-
-
-# ==================================================
-# MODEL 2 DEMO SESSION ASSIGNMENT
-# ==================================================
-
-MODEL2_DRIVER_TRANSACTIONS = {
-
-    17: 44010000100000052203030401089310,
-
-    24: 44020100400000012010151800001210,
-
+MODEL2_DEMO_USERS = {
+    int(driver): user
+    for driver, user in json.load(open(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "esp32", "tools", "vectors", "model2_demo_users.json"
+    ))).items()
 }
 
 
 # ==================================================
-# LOAD MODEL 3 DRIVER-SPECIFIC DATA
+# MODEL 4 - ENERGY CONSUMPTION AND ARRIVAL SOC
 #
 # Used only by OLD /predict testing endpoint.
-# Final ESP32 architecture uses ESP32 Model 3.
+# Final ESP32 architecture uses ESP32 Model 4.
 # ==================================================
 
-MODEL3_DATA_DIR = os.path.join(
-    PROJECT_ROOT, "data", "raw"
-)
-
-
-MODEL3_DRIVER_FILES = {
-
-    17: "LFP01_fast_feature.xlsx",
-
-    18: "NMC02_fast_feature.xlsx",
-
-    19: "Lab_fast_feature.xlsx",
-
-    20: "NMC01_Car01_fast_feature.xlsx",
-
-    21: "NMC01_slow_feature.xlsx",
-
-    24: "NMC01_Car02_fast_feature.xlsx",
-
-}
+from model4_energy import run_model4, demo_trips as MODEL4_DEMO_TRIPS
+from model2_charging_recommendation import charge_level_model
+from explain import explain_all
 
 
 # ==================================================
-# MODEL 3 PREPROCESSED DATA CACHE
+# MODEL 3 - FEDERATED SOH FORECASTING
+#
+# Used by the /predict testing endpoint. The ESP32 runs
+# the same federated model on the car. Demo batteries:
+# MODEL3_DRIVER_BATTERIES (model3_soh_federated.py).
 # ==================================================
-
-model3_driver_data = {}
-
-
-print(
-    "\nLoading Model 3 driver-specific datasets..."
-)
-
-
-for driver_id, filename in MODEL3_DRIVER_FILES.items():
-
-    file_path = os.path.join(
-        MODEL3_DATA_DIR,
-        filename
-    )
-
-    if not os.path.exists(file_path):
-
-        raise FileNotFoundError(
-            f"Model 3 dataset not found for "
-            f"Driver {driver_id}: {file_path}"
-        )
-
-    raw_data = pd.read_excel(
-        file_path
-    )
-
-    print(
-        f"Driver {driver_id}: "
-        f"{filename} "
-        f"({len(raw_data)} rows)"
-    )
-
-    print(
-        f"Preprocessing Model 3 data "
-        f"for Driver {driver_id}..."
-    )
-
-    prepared_data = prepare_model3_data(
-        raw_data
-    )
-
-    model3_driver_data[
-        driver_id
-    ] = prepared_data
-
-    print(
-        f"Driver {driver_id} preprocessing "
-        f"completed. "
-        f"Shape: {prepared_data.shape}"
-    )
-
-
-print(
-    "All Model 3 driver datasets "
-    "loaded and cached."
-)
 
 
 # ==================================================
@@ -186,26 +134,53 @@ class DriverRequest(BaseModel):
 
 
 # ==================================================
+# WHAT-IF SIMULATOR REQUEST
+#
+# The driver's alternative decision. Factors are
+# relative to the driver's current behaviour
+# (1.0 = unchanged).
+# ==================================================
+
+class WhatIfRequest(BaseModel):
+
+    station: str
+
+    target_soc: float
+
+    power_kw: float | None = None
+
+    driving_style: float = 1.0
+
+    speed: float = 1.0
+
+    climate: float = 1.0
+
+
+# ==================================================
 # ESP32 EDGE RESULT FORMAT
 #
-# ESP32 performs ALL THREE ML INFERENCES.
+# ESP32 performs the ML INFERENCES of all four
+# modules.
 #
 # FastAPI receives:
 #
 #   Model 1 prediction
-#   Model 2 prediction
+#   Model 2 charge level and urgency
 #   Model 3 prediction
+#   Model 4 energy and arrival SOC
 #
 # AND their actual ESP32-side latency.
 #
-# FastAPI does NOT run XGBoost here.
+# FastAPI does NOT run the edge models here.
 #
 # FastAPI only:
 #
 #   1. Receives edge predictions
-#   2. Generates recommendations
-#   3. Stores result
-#   4. Serves /latest
+#   2. Ranks the charging stations (Model 2:
+#      site congestion + decision layer)
+#   3. Generates recommendations
+#   4. Stores result
+#   5. Serves /latest
 # ==================================================
 
 class ESP32Result(BaseModel):
@@ -230,15 +205,21 @@ class ESP32Result(BaseModel):
 
     # ----------------------------------------------
     # Model 2
+    #
+    # charge_need_pct: 85th-percentile battery need
+    # until the next charge (%); target_soc adds the
+    # 15 % reserve.
     # ----------------------------------------------
 
-    charging: str
+    model_2_charge_need_pct: float
 
-    model_2_prediction: int
+    model_2_target_soc: float
 
-    model_2_probability: float
+    model_2_urgency: str
 
-    model_2_status: str
+    model_2_urgency_class: int
+
+    model_2_battery_kwh: float
 
     model_2_latency_ms: float
 
@@ -249,13 +230,22 @@ class ESP32Result(BaseModel):
 
     soh: float
 
+    soh_now: float
+
     battery_risk: str
 
-    cap: float
-
-    cap_corr: float
-
     model_3_latency_ms: float
+
+
+    # ----------------------------------------------
+    # Model 4
+    # ----------------------------------------------
+
+    model_4_energy_kwh_per_km: float
+
+    model_4_arrival_soc_pct: float
+
+    model_4_latency_ms: float
 
 
     # ----------------------------------------------
@@ -268,6 +258,7 @@ class ESP32Result(BaseModel):
     # Model 1
     # + Model 2
     # + Model 3
+    # + Model 4
     #
     # It does NOT include:
     #
@@ -439,126 +430,54 @@ def get_stress_status(stress):
 
 
 # ==================================================
-# MODEL 1 RECOMMENDATIONS
-# ==================================================
-
-def get_driving_recommendations(
-    features,
-    stress
-):
-
-    recommendations = []
-
-
-    # ----------------------------------------------
-    # Hard acceleration
-    # ----------------------------------------------
-
-    if features["hard_accel_count"] >= 5:
-
-        recommendations.append(
-            "Frequent hard acceleration detected; "
-            "use smoother acceleration."
-        )
-
-
-    # ----------------------------------------------
-    # Hard braking
-    # ----------------------------------------------
-
-    if features["hard_brake_count"] >= 5:
-
-        recommendations.append(
-            "Frequent hard braking detected; "
-            "brake more smoothly when possible."
-        )
-
-
-    # ----------------------------------------------
-    # Driving aggressiveness
-    # ----------------------------------------------
-
-    if features[
-        "driver_aggressiveness_score"
-    ] >= 70:
-
-        recommendations.append(
-            "High driving aggressiveness detected; "
-            "adopt smoother driving behaviour."
-        )
-
-
-    # ----------------------------------------------
-    # Regenerative braking
-    # ----------------------------------------------
-
-    if features["regen_braking_pct"] < 15:
-
-        recommendations.append(
-            "Low regenerative braking usage; "
-            "use regenerative braking more consistently."
-        )
-
-
-    # ----------------------------------------------
-    # High battery stress
-    # ----------------------------------------------
-
-    if stress >= 70:
-
-        recommendations.append(
-            "High battery stress detected; "
-            "adopt smoother driving behaviour."
-        )
-
-
-    # ----------------------------------------------
-    # No warnings
-    # ----------------------------------------------
-
-    if not recommendations:
-
-        recommendations.append(
-            "Driving behaviour is relatively smooth."
-        )
-
-
-    return recommendations
-
-
-# ==================================================
 # MODEL 2 RECOMMENDATIONS
+#
+# recommendation: output of recommend_charging()
+# (target SOC, ranked stations, message).
 # ==================================================
 
 def get_charging_recommendations(
-    prediction,
-    probability
+    recommendation
 ):
 
     recommendations = []
 
+    stations = recommendation["stations"]
 
-    if prediction == 1:
+
+    if not stations:
 
         recommendations.append(
-            "Abnormal charging behaviour detected; "
-            "review the charging session before continued use."
+            recommendation["message"]
         )
 
-        recommendations.append(
-            "Avoid prolonged high-stress charging sessions "
-            "until the charging behaviour is verified."
-        )
+        return recommendations
 
-    else:
+
+    best = stations[0]
+
+    recommendations.append(
+        f"Charge to {recommendation['target_soc']:.0f}% at "
+        f"{best['name']}. It takes about {best['total_min']:.0f} min "
+        f"in total, including the drive there and any waiting."
+    )
+
+
+    # ----------------------------------------------
+    # Why not the nearest station?
+    # ----------------------------------------------
+
+    nearest = min(
+        stations,
+        key=lambda s: s["distance_km"]
+    )
+
+    if nearest["name"] != best["name"]:
 
         recommendations.append(
-            "Charging behaviour is within the "
-            "normal operating pattern."
-        )
-
-        recommendations.append(
-            "Continue following recommended charging practices."
+            f"{nearest['name']} is closer, but you may have to "
+            f"wait about {nearest['wait_min']:.0f} min there, "
+            f"so {best['name']} is faster overall."
         )
 
 
@@ -566,133 +485,74 @@ def get_charging_recommendations(
 
 
 # ==================================================
-# MODEL 3 RECOMMENDATIONS
+# SHAP-BASED RECOMMENDATIONS
+#
+# Every recommendation comes from the SHAP explanation
+# of the driver's own prediction (explain.py): a factor
+# becomes advice only if the driver can change it and
+# SHAP shows that it makes the prediction worse now.
+# The charging station choice comes from the Module 2
+# decision layer (its time breakdown is its explanation).
 # ==================================================
 
-def get_battery_recommendations(
-    soh,
-    battery_risk
-):
+def explain_driver(driver_id, charging_recommendation, soh, soh_now, battery_risk):
 
-    recommendations = []
+    demo_user = MODEL2_DEMO_USERS[driver_id]
 
+    m2_x = charge_level_model.transform(
+        demo_user["charge_level_features"],
+        demo_user["location"]
+    )
 
-    if battery_risk == "High":
-
-        recommendations.append(
-            f"Battery health is reduced ({soh:.2f}% SOH); "
-            "avoid unnecessary charging and thermal stress."
-        )
-
-        recommendations.append(
-            "Prefer moderate charging conditions and "
-            "avoid prolonged high-stress operation."
-        )
-
-
-    elif battery_risk == "Medium":
-
-        recommendations.append(
-            f"Battery health is moderately reduced ({soh:.2f}% SOH); "
-            "follow consistent charging practices."
-        )
-
-
-    elif battery_risk == "Low":
-
-        recommendations.append(
-            f"Battery health is currently good ({soh:.2f}% SOH)."
-        )
-
-
-    else:
-
-        recommendations.append(
-            f"Battery health status is {battery_risk} "
-            f"({soh:.2f}% SOH); monitor battery behaviour."
-        )
-
-
-    return recommendations
-
-
-# ==================================================
-# CROSS-MODEL PERSONALIZED RECOMMENDATIONS
-# ==================================================
-
-def get_combined_recommendations(
-    driving_recommendations,
-    charging_recommendations,
-    battery_recommendations,
-    stress,
-    model2_prediction,
-    battery_risk
-):
-
-    recommendations = []
-
-
-    # ----------------------------------------------
-    # Driving
-    # ----------------------------------------------
-
-    recommendations.extend(
-        driving_recommendations
+    return explain_all(
+        driver_id,
+        driver_features[driver_id],
+        m2_x,
+        demo_user["charge_level_features"],
+        charging_recommendation["target_soc"],
+        soh_now,
+        soh,
+        battery_risk,
+        MODEL4_DEMO_TRIPS[str(driver_id)]["energy_features"]
     )
 
 
-    # ----------------------------------------------
-    # Charging
-    # ----------------------------------------------
+def build_recommendations(explanations, charging_recommendation,
+                          energy_kwh_per_km, arrival_soc_pct):
+    """Returns the insights (module, text, kind) and the same texts as a list.
+    kind: "action" = SHAP shows a controllable factor making things worse,
+    "info" = explanation or decision without a needed change."""
 
-    recommendations.extend(
-        charging_recommendations
-    )
+    insights = []
 
+    # topic: customer-facing label shown on the dashboard
+    topics = {"Module 1": "Driving", "Module 2": "Charging",
+              "Module 3": "Battery", "Module 4": "Trip"}
 
-    # ----------------------------------------------
-    # Battery
-    # ----------------------------------------------
+    def add(module, items):
+        for item in items:
+            insights.append(dict(module=module, topic=topics[module], **item))
 
-    recommendations.extend(
-        battery_recommendations
-    )
+    # Module 1: driving (SHAP of the stress prediction)
+    add("Module 1", explanations["stress"]["advice"])
 
+    # Module 2: station and charge level (decision layer)
+    # and why this charge level (SHAP of the charge need)
+    add("Module 2", [dict(text=t, kind="info")
+                     for t in get_charging_recommendations(charging_recommendation)])
+    add("Module 2", explanations["charging"]["advice"])
 
-    # ----------------------------------------------
-    # Abnormal charging + high battery risk
-    # ----------------------------------------------
+    # Module 3: battery health (SHAP of the SOH forecast)
+    add("Module 3", explanations["battery"]["advice"])
 
-    if (
-        model2_prediction == 1
-        and battery_risk == "High"
-    ):
+    # Module 4: energy (SHAP of the energy prediction)
+    add("Module 4", [dict(
+        text=f"This trip should use about {1000 * energy_kwh_per_km:.0f} Wh/km. "
+             f"You should arrive with about {arrival_soc_pct:.0f}% battery.",
+        kind="info")])
+    add("Module 4", explanations["energy"]["advice"])
 
-        recommendations.append(
-            "Abnormal charging behaviour and high "
-            "battery health risk were detected together; "
-            "minimize charging and driving stress until "
-            "the battery and charging system are checked."
-        )
-
-
-    # ----------------------------------------------
-    # High driving stress + high battery risk
-    # ----------------------------------------------
-
-    elif (
-        stress >= 70
-        and battery_risk == "High"
-    ):
-
-        recommendations.append(
-            "High driving stress combined with reduced "
-            "battery health; use smoother driving "
-            "and avoid unnecessary high-load operation."
-        )
-
-
-    return recommendations
+    return insights, [i["text"] for i in insights]
 
 
 # ==================================================
@@ -833,67 +693,64 @@ def receive_esp32_result(
     # MODEL 1 PERSONALIZED RECOMMENDATIONS
     # ==================================================
 
-    driving_recommendations = (
-        get_driving_recommendations(
-
-            features,
-
-            data.stress
-
-        )
-    )
+    
 
 
     # ==================================================
-    # MODEL 2 PERSONALIZED RECOMMENDATIONS
+    # MODEL 2 CHARGING RECOMMENDATION
+    #
+    # The ESP32 sends the predicted charge need and
+    # urgency. The server adds the site congestion
+    # forecast and ranks the stations. The charge on
+    # arrival from Model 4 is the starting SOC.
     # ==================================================
 
-    charging_recommendations = (
-        get_charging_recommendations(
+    charging_recommendation = recommend_charging(
 
-            data.model_2_prediction,
+        current_soc=data.model_4_arrival_soc_pct,
 
-            data.model_2_probability
+        battery_kwh=data.model_2_battery_kwh,
 
-        )
+        charge_need_pct=data.model_2_charge_need_pct,
+
+        urgency_class=data.model_2_urgency_class
+
     )
+
+    
+
+
+    # ==================================================
+    # MODEL 4 PERSONALIZED RECOMMENDATIONS
+    # ==================================================
+
+    
 
 
     # ==================================================
     # MODEL 3 PERSONALIZED RECOMMENDATIONS
     # ==================================================
 
-    battery_recommendations = (
-        get_battery_recommendations(
-
-            data.soh,
-
-            battery_risk
-
-        )
-    )
+    
 
 
     # ==================================================
     # COMBINED PERSONALIZED INSIGHTS
     # ==================================================
 
-    recommendations = (
-        get_combined_recommendations(
+    explanations = explain_driver(
+        data.driver_id,
+        charging_recommendation,
+        data.soh,
+        data.soh_now,
+        battery_risk
+    )
 
-            driving_recommendations,
-
-            charging_recommendations,
-
-            battery_recommendations,
-
-            data.stress,
-
-            data.model_2_prediction,
-
-            battery_risk
-
-        )
+    insights, recommendations = build_recommendations(
+        explanations,
+        charging_recommendation,
+        data.model_4_energy_kwh_per_km,
+        data.model_4_arrival_soc_pct
     )
 
 
@@ -961,26 +818,35 @@ def receive_esp32_result(
         # Model 2
         # ----------------------------------------------
 
-        "charging":
-            data.charging,
-
-        "model_2_prediction":
-            data.model_2_prediction,
-
-        "model_2_probability":
+        "model_2_charge_need_pct":
             round(
-                data.model_2_probability,
-                6
+                data.model_2_charge_need_pct,
+                2
             ),
 
-        "model_2_status":
-            data.model_2_status,
+        "model_2_target_soc":
+            round(
+                data.model_2_target_soc,
+                1
+            ),
+
+        "model_2_urgency":
+            data.model_2_urgency,
+
+        "model_2_urgency_class":
+            data.model_2_urgency_class,
+
+        "model_2_battery_kwh":
+            data.model_2_battery_kwh,
 
         "model_2_latency_ms":
             round(
                 data.model_2_latency_ms,
                 3
             ),
+
+        "charging_recommendation":
+            charging_recommendation,
 
 
         # ----------------------------------------------
@@ -996,21 +862,38 @@ def receive_esp32_result(
         "battery_risk":
             battery_risk,
 
-        "cap":
+        "soh_now":
             round(
-                data.cap,
-                4
-            ),
-
-        "cap_corr":
-            round(
-                data.cap_corr,
-                4
+                data.soh_now,
+                2
             ),
 
         "model_3_latency_ms":
             round(
                 data.model_3_latency_ms,
+                3
+            ),
+
+
+        # ----------------------------------------------
+        # Model 4
+        # ----------------------------------------------
+
+        "model_4_energy_kwh_per_km":
+            round(
+                data.model_4_energy_kwh_per_km,
+                4
+            ),
+
+        "model_4_arrival_soc_pct":
+            round(
+                data.model_4_arrival_soc_pct,
+                1
+            ),
+
+        "model_4_latency_ms":
+            round(
+                data.model_4_latency_ms,
                 3
             ),
 
@@ -1034,6 +917,12 @@ def receive_esp32_result(
 
         "recommendations":
             recommendations,
+
+        "explanations":
+            explanations,
+
+        "insights":
+            insights,
 
 
         # ----------------------------------------------
@@ -1091,19 +980,30 @@ def receive_esp32_result(
 
     print(
         "Charging     :",
-        data.charging
+        charging_recommendation["message"]
     )
 
 
     print(
-        "Charging Prob:",
-        data.model_2_probability
+        "Urgency      :",
+        data.model_2_urgency
     )
 
 
     print(
-        "SOH          :",
-        data.soh
+        "Energy       :",
+        data.model_4_energy_kwh_per_km,
+        "kWh/km, arrival SOC",
+        data.model_4_arrival_soc_pct,
+        "%"
+    )
+
+
+    print(
+        "SOH (+10 cyc):",
+        data.soh,
+        "  now:",
+        data.soh_now
     )
 
 
@@ -1137,6 +1037,13 @@ def receive_esp32_result(
     print(
         "Model 3      :",
         data.model_3_latency_ms,
+        "ms"
+    )
+
+
+    print(
+        "Model 4      :",
+        data.model_4_latency_ms,
         "ms"
     )
 
@@ -1248,7 +1155,7 @@ def predict(data: DriverRequest):
         )
 
 
-    if driver_id not in model3_driver_data:
+    if driver_id not in MODEL3_DRIVER_BATTERIES:
 
         raise HTTPException(
             status_code=400,
@@ -1259,12 +1166,12 @@ def predict(data: DriverRequest):
         )
 
 
-    if driver_id not in MODEL2_DRIVER_TRANSACTIONS:
+    if driver_id not in MODEL2_DEMO_USERS:
 
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Model 2 charging session is not "
+                f"Model 2 charging user is not "
                 f"configured for Driver {driver_id}."
             )
         )
@@ -1341,71 +1248,89 @@ def predict(data: DriverRequest):
     )
 
 
-    driving_recommendations = (
-        get_driving_recommendations(
+    
 
-            features,
 
-            stress
+    # ==================================================
+    # MODEL 4
+    #
+    # Runs before Model 2: the predicted charge on
+    # arrival is the starting SOC of the charging
+    # recommendation.
+    # ==================================================
 
-        )
+    model4_start = time.perf_counter()
+
+    model4_result = run_model4(
+        driver_id
     )
+
+    model4_latency_ms = (
+        time.perf_counter()
+        - model4_start
+    ) * 1000
+
+
+    
 
 
     # ==================================================
     # MODEL 2
     # ==================================================
 
-    transaction_id = (
-        MODEL2_DRIVER_TRANSACTIONS[
-            driver_id
-        ]
+    demo_user = MODEL2_DEMO_USERS[
+        driver_id
+    ]
+
+
+    model2_start = time.perf_counter()
+
+
+    charge_need_pct = predict_charge_need(
+
+        demo_user["charge_level_features"],
+
+        demo_user["location"]
+
     )
 
 
-    model2_result = run_model2(
-        transaction_id=transaction_id
+    urgency_class, urgency_probs = predict_urgency(
+
+        demo_user["urgency_features"],
+
+        demo_user["location"],
+
+        demo_user["user_id"]
+
     )
 
 
-    model2_prediction = int(
-        model2_result["prediction"]
+    model2_latency_ms = (
+        time.perf_counter()
+        - model2_start
+    ) * 1000
+
+
+    urgency = URGENCY_NAMES[
+        urgency_class
+    ]
+
+
+    charging_recommendation = recommend_charging(
+
+        current_soc=model4_result["arrival_soc_pct"],
+
+        battery_kwh=demo_user["battery_capacity_kwh"],
+
+        charge_need_pct=charge_need_pct,
+
+        urgency_class=urgency_class
+
     )
 
 
-    model2_probability = float(
-        model2_result["fault_probability"]
-    )
-
-
-    model2_status = (
-        model2_result["status"]
-    )
-
-
-    model2_latency_ms = float(
-        model2_result["latency_ms"]
-    )
-
-
-    if model2_prediction == 1:
-
-        charging = "Faulty"
-
-    else:
-
-        charging = "Healthy"
-
-
-    charging_recommendations = (
-        get_charging_recommendations(
-
-            model2_prediction,
-
-            model2_probability
-
-        )
-    )
+    
 
 
     # ==================================================
@@ -1413,12 +1338,7 @@ def predict(data: DriverRequest):
     # ==================================================
 
     model3_result = run_model3(
-
-        preprocessed_data=
-        model3_driver_data[
-            driver_id
-        ]
-
+        driver_id
     )
 
 
@@ -1443,37 +1363,26 @@ def predict(data: DriverRequest):
     )
 
 
-    battery_recommendations = (
-        get_battery_recommendations(
-
-            soh,
-
-            battery_risk
-
-        )
-    )
+    
 
 
     # ==================================================
     # COMBINED RECOMMENDATIONS
     # ==================================================
 
-    recommendations = (
-        get_combined_recommendations(
+    explanations = explain_driver(
+        driver_id,
+        charging_recommendation,
+        soh,
+        model3_result["soh_now_percent"],
+        battery_risk
+    )
 
-            driving_recommendations,
-
-            charging_recommendations,
-
-            battery_recommendations,
-
-            stress,
-
-            model2_prediction,
-
-            battery_risk
-
-        )
+    insights, recommendations = build_recommendations(
+        explanations,
+        charging_recommendation,
+        model4_result["energy_kwh_per_km"],
+        model4_result["arrival_soc_pct"]
     )
 
 
@@ -1520,29 +1429,38 @@ def predict(data: DriverRequest):
                 3
             ),
 
-        "charging":
-            charging,
+        "model_2_user_id":
+            demo_user["user_id"],
 
-        "model_2_transaction_id":
-            transaction_id,
-
-        "model_2_prediction":
-            model2_prediction,
-
-        "model_2_probability":
+        "model_2_charge_need_pct":
             round(
-                model2_probability,
-                6
+                charge_need_pct,
+                2
             ),
 
-        "model_2_status":
-            model2_status,
+        "model_2_target_soc":
+            charging_recommendation["target_soc"],
+
+        "model_2_urgency":
+            urgency,
+
+        "model_2_urgency_class":
+            urgency_class,
+
+        "model_2_battery_kwh":
+            demo_user["battery_capacity_kwh"],
+
+        "model_2_urgency_probs":
+            [round(p, 4) for p in urgency_probs],
 
         "model_2_latency_ms":
             round(
                 model2_latency_ms,
                 3
             ),
+
+        "charging_recommendation":
+            charging_recommendation,
 
         "soh":
             round(
@@ -1553,14 +1471,14 @@ def predict(data: DriverRequest):
         "battery_risk":
             battery_risk,
 
-        "cap":
+        "soh_now":
             model3_result[
-                "cap"
+                "soh_now_percent"
             ],
 
-        "cap_corr":
+        "model_3_battery":
             model3_result[
-                "cap_corr"
+                "battery"
             ],
 
         "model_3_latency_ms":
@@ -1569,8 +1487,29 @@ def predict(data: DriverRequest):
                 3
             ),
 
+        "model_4_trip":
+            model4_result["trip"],
+
+        "model_4_energy_kwh_per_km":
+            model4_result["energy_kwh_per_km"],
+
+        "model_4_arrival_soc_pct":
+            model4_result["arrival_soc_pct"],
+
+        "model_4_latency_ms":
+            round(
+                model4_latency_ms,
+                3
+            ),
+
         "recommendations":
             recommendations,
+
+        "explanations":
+            explanations,
+
+        "insights":
+            insights,
 
         "prediction_id":
             prediction_counter,
@@ -1588,6 +1527,102 @@ def predict(data: DriverRequest):
 
 
     return response
+
+
+# ==================================================
+# WHAT-IF SIMULATOR
+#
+# Compares the recommended charging option with the
+# driver's own scenario, for the latest result.
+# Runs on the server: the dashboard calls it
+# whenever the driver changes a setting.
+# ==================================================
+
+@app.post("/whatif")
+def what_if(request: WhatIfRequest):
+
+    if latest_result is None:
+
+        raise HTTPException(
+            status_code=400,
+            detail="No result yet. Send an ESP32 result or call /predict first."
+        )
+
+
+    station_names = [
+        station["name"]
+        for station in STATIONS
+    ]
+
+    if request.station not in station_names:
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown station. Available: {station_names}"
+        )
+
+
+    if not 30 <= request.target_soc <= 100:
+
+        raise HTTPException(
+            status_code=400,
+            detail="target_soc must be between 30 and 100."
+        )
+
+
+    for name in ["driving_style", "speed", "climate"]:
+
+        if not 0.5 <= getattr(request, name) <= 1.5:
+
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must be between 0.5 and 1.5."
+            )
+
+
+    recommendation = latest_result["charging_recommendation"]
+
+    driver_id = latest_result["driver_id"]
+
+
+    # ----------------------------------------------
+    # Starting point: the recommended option. When no
+    # charging is needed, the reference is "no charge"
+    # at the nearest station.
+    # ----------------------------------------------
+
+    context = {
+
+        "driver_id": driver_id,
+
+        "current_soc": recommendation["current_soc"],
+
+        "battery_kwh": latest_result["model_2_battery_kwh"],
+
+        "recommended_station":
+            recommendation["recommended_station"] or station_names[0],
+
+        "target_soc":
+            recommendation["target_soc"]
+            if recommendation["recommended_station"]
+            else recommendation["current_soc"],
+
+    }
+
+
+    return run_whatif(
+
+        context,
+
+        model1,
+
+        FEATURE_NAMES,
+
+        driver_features[driver_id],
+
+        request.model_dump()
+
+    )
 
 
 # ==================================================
@@ -1616,6 +1651,112 @@ def get_latest():
 
 
 # ==================================================
+# ON-DEVICE FEDERATED LEARNING
+#
+# The ESP32 (one real car) downloads the global model
+# of each task, trains it on its own data and uploads
+# only the weights. The server aggregates them with the
+# simulated fleet and returns the new global model.
+# Weights travel as little-endian float32 arrays.
+# See federated.py.
+# ==================================================
+
+def get_fl_task(task):
+
+    if task not in federated.TASKS:
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Unknown federated task '{task}'. "
+                f"Available: {sorted(federated.TASKS)}"
+            )
+        )
+
+    return federated.TASKS[task]
+
+
+@app.get("/fl/global/{task}")
+def fl_global(task: str):
+
+    state = get_fl_task(task)
+
+    return Response(
+        content=state.payload(),
+        media_type="application/octet-stream",
+        headers={
+            "X-FL-Round": str(state.round),
+            "X-FL-Floats": str(state.n_floats),
+        },
+    )
+
+
+@app.post("/fl/update/{task}")
+async def fl_update(task: str, request: Request, client: str = "esp32", n: int = 1):
+
+    state = get_fl_task(task)
+
+    if n < 1:
+
+        raise HTTPException(
+            status_code=400,
+            detail="n (number of local samples) must be at least 1."
+        )
+
+    body = await request.body()
+
+    try:
+
+        info = state.run_round(body, n, client)
+
+    except ValueError as error:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+
+    print(
+        f"FL {task} round {info['round']}: {client} + "
+        f"{info['fleet_clients']} simulated cars, "
+        f"server {info['server_ms']} ms"
+    )
+
+    return Response(
+        content=state.payload(),
+        media_type="application/octet-stream",
+        headers={
+            "X-FL-Round": str(info["round"]),
+            "X-FL-Participants": str(info["participants"]),
+            "X-FL-Server-Ms": str(info["server_ms"]),
+        },
+    )
+
+
+@app.post("/fl/report")
+def fl_report(report: dict):
+
+    if not isinstance(report.get("tasks"), list):
+
+        raise HTTPException(
+            status_code=400,
+            detail="The report needs a 'tasks' list."
+        )
+
+    report["received_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    federated.latest_fl_report = report
+
+    return {"status": "received"}
+
+
+@app.get("/fl/status")
+def fl_status():
+
+    return federated.fl_status()
+
+
+# ==================================================
 # HEALTH CHECK
 # ==================================================
 
@@ -1638,6 +1779,12 @@ def root():
 
         "model_3":
             "loaded",
+
+        "model_4":
+            "loaded",
+
+        "federated_learning":
+            sorted(federated.TASKS),
 
         "edge_endpoint":
             "/esp32/result",
